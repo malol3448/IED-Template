@@ -258,3 +258,18 @@ goose_destroy(void *ctx_ptr)
     GooseReceiver_destroy(g->receiver);
     printf("goose destroyed\n");
 }
+
+bool
+goose_link_ok(const void *ctx_ptr)
+{
+    if (!ctx_ptr)
+        return false;
+
+    const goose_ctx *g = (const goose_ctx *)ctx_ptr;
+
+    /* пока не было ни одного кадра — считаем связь ещё не установленной */
+    if (!g->hasLastFrame)
+        return false;
+
+    return !g->linkFailed;
+}
