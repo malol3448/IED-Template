@@ -24,12 +24,18 @@ static void sigint_handler(int sig)
 int
 main(int argc, char** argv)
 {
-    void* goose_ctx = Goose_create();
+    void* goose_ctx = Goose_create(NULL, NULL);
     
     signal(SIGINT, sigint_handler);
     
     while(running == 1){
         bool newValue = goose_tick(goose_ctx);
+        if (newValue) {
+            printf("Pins after new message: ");
+            for (int i = 0; i < 4; i++)
+                printf("%d ", goose_get_pin(goose_ctx, i));
+            printf("\n");
+        }
         usleep(1000000);
     }
     

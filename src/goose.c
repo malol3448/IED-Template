@@ -1,29 +1,10 @@
-/*
- *  goose_subscriber.c
- *
- *  Copyright 2013-2024 Michael Zillgith
- *
- *  This file is part of libIEC61850.
- *
- *  libIEC61850 is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, either version 3 of the License, or
- *  (at your option) any later version.
- *
- *  libIEC61850 is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with libIEC61850.  If not, see <http://www.gnu.org/licenses/>.
- *
- *  See COPYING file for the complete license text.
- */
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <signal.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "libiec61850_platform_includes.h"
 
 #include "goose.h"
@@ -32,6 +13,7 @@
 #include "goose_subscriber.h"
 #include "hal_ethernet.h"
 #include "hal_thread.h"
+#include "hal_time.h"
 #include "linked_list.h"
 
 #include "ber_decode.h"
@@ -43,96 +25,236 @@
 
 typedef struct goose_ctx
 {
-    GooseReceiver receiver;
+    GooseReceiver   receiver;
     GooseSubscriber subscriber;
-    GooseListener listener;      /* издатель libiec61850 */
-    LinkedList    *dataSet;        /* набор данных: 4 MmsValue (BOOLEAN) */
-    bool           pins[4];        /* текущее состояние 4 значений датасета */
-    uint64_t       lastPublishMs;  /* время последней отправки, мс */
-    volatile bool newMessage;
+    bool            pins[4];
+    uint32_t        lastStNum;
+    uint32_t        lastSqNum;
+    uint32_t        timeAllowedToLive;   /* мс, из последнего кадра */
+    uint64_t        lastRxMs;            /* время последнего приёма */
+    bool            hasLastFrame;        /* уже принимали хотя бы один кадр */
+    bool            linkFailed;          /* авария связи */
+    volatile bool   newMessage;          /* флаг для goose_tick */
 } goose_ctx;
 
 goose_ctx ctx;
 
+/* ------------------------------------------------------------------ */
+/*  Обработчик, вызываемый библиотекой при каждом принятом GOOSE      */
+/* ------------------------------------------------------------------ */
 static void
-gooseListener(GooseSubscriber subscriber, void* parameter)
+gooseListener(GooseSubscriber subscriber, void *parameter)
 {
-    goose_ctx* goose_ctx = parameter;
-    printf("GOOSE event:\n");
-    printf("  stNum: %u sqNum: %u\n", GooseSubscriber_getStNum(subscriber),
-            GooseSubscriber_getSqNum(subscriber));
-    printf("  timeToLive: %u\n", GooseSubscriber_getTimeAllowedToLive(subscriber));
+    goose_ctx *g = (goose_ctx *)parameter;
 
-    uint64_t timestamp = GooseSubscriber_getTimestamp(subscriber);
+    uint32_t stNum = GooseSubscriber_getStNum(subscriber);
+    uint32_t sqNum = GooseSubscriber_getSqNum(subscriber);
+    uint32_t tal   = GooseSubscriber_getTimeAllowedToLive(subscriber);
+    uint64_t now   = Hal_getTimeInMs();
 
-    printf("  timestamp: %u.%u\n", (uint32_t) (timestamp / 1000), (uint32_t) (timestamp % 1000));
-    printf("  message is %s\n", GooseSubscriber_isValid(subscriber) ? "valid" : "INVALID");
-
-    MmsValue* values = GooseSubscriber_getDataSetValues(subscriber);
-
-    char buffer[1024];
-
-    MmsValue_printToBuffer(values, buffer, 1024);
-
-    printf("  allData: %s\n", buffer);
+    /* --- разбор датасета (строго 4 BOOLEAN) --- */
+    MmsValue *values = GooseSubscriber_getDataSetValues(subscriber);
+    if (!values) {
+        printf("[RX] no dataset\n");
+        return;
+    }
 
     int arraySize = MmsValue_getArraySize(values);
-    int i;
-    for (i = 0; i < arraySize; i++)
-    {
-        MmsValue *pin_value = MmsValue_getElement(values, i);
-        bool pin_state = MmsValue_getBoolean(pin_value);
-        if (pin_state != goose_ctx->pins[i]){
-            goose_ctx->newMessage = true;
-            printf("New message\n");
-            break;
+    if (arraySize != 4) {
+        printf("[RX] unexpected dataset size: %d (expected 4)\n", arraySize);
+        return;
+    }
+
+    bool newPins[4];
+    for (int i = 0; i < 4; i++) {
+        MmsValue *el = MmsValue_getElement(values, i);
+        if (MmsValue_getType(el) != MMS_BOOLEAN) {
+            printf("[RX] element %d is not BOOLEAN\n", i);
+            return;
         }
-        goose_ctx->pins[i] = pin_state;
+        newPins[i] = MmsValue_getBoolean(el);
+    }
+
+    /* --- классификация сообщения --- */
+    bool stateChanged = false;
+    bool isRetransmission = false;
+    int  lostCount = 0;
+
+    if (!g->hasLastFrame) {
+        /* первое сообщение */
+        stateChanged = true;
+    }
+    else if (stNum != g->lastStNum) {
+        /* stNum изменился → новое состояние */
+        if (stNum < g->lastStNum) {
+            /* stNum уменьшился — издатель, скорее всего, перезапустился */
+            printf("[RX] stNum decreased (%u → %u) — publisher restart?\n",
+                   g->lastStNum, stNum);
+        }
+        stateChanged = true;
+    }
+    else {
+        /* stNum тот же */
+        if (sqNum == g->lastSqNum) {
+            /* полный дубликат — игнорируем */
+            return;
+        }
+        else if (sqNum == g->lastSqNum + 1) {
+            /* нормальная ретрансляция / heartbeat */
+            isRetransmission = true;
+
+            /* датасет должен совпадать */
+            bool mismatch = false;
+            for (int i = 0; i < 4; i++) {
+                if (newPins[i] != g->pins[i]) {
+                    mismatch = true;
+                    break;
+                }
+            }
+            if (mismatch) {
+                printf("[RX] WARNING: retransmission with different dataset "
+                       "(stNum=%u sqNum=%u)\n", stNum, sqNum);
+            }
+        }
+        else if (sqNum > g->lastSqNum + 1) {
+            /* пропущены кадры */
+            lostCount = (int)(sqNum - g->lastSqNum - 1);
+            printf("[RX] LOST %d frame(s) (sqNum %u → %u)\n",
+                   lostCount, g->lastSqNum, sqNum);
+            /* считаем это обновлением состояния на всякий случай */
+            stateChanged = true;
+        }
+        else {
+            /* sqNum уменьшился при том же stNum — аномалия */
+            printf("[RX] anomalous sqNum (%u → %u) at stNum=%u\n",
+                   g->lastSqNum, sqNum, stNum);
+            stateChanged = true;
+        }
+    }
+
+    /* --- сохраняем новое состояние --- */
+    for (int i = 0; i < 4; i++)
+        g->pins[i] = newPins[i];
+
+    g->lastStNum         = stNum;
+    g->lastSqNum         = sqNum;
+    g->timeAllowedToLive = tal;
+    g->lastRxMs          = now;
+    g->hasLastFrame      = true;
+    g->linkFailed        = false;          /* связь восстановилась */
+    g->newMessage        = true;           /* сообщить tick */
+
+    /* --- краткий лог прямо в listener (детальный — в tick) --- */
+    if (stateChanged) {
+        printf("[RX] STATE CHANGE  stNum=%u sqNum=%u\n", stNum, sqNum);
+    } else if (isRetransmission) {
+        printf("[RX] RETRANSMISSION stNum=%u sqNum=%u\n", stNum, sqNum);
     }
 }
 
-void*
-Goose_create(char* goCbRef, MmsValue* dataSetValues)
+/* ------------------------------------------------------------------ */
+void *
+Goose_create(char *goCbRef, MmsValue *dataSetValues)
 {
+    (void)goCbRef;
+    (void)dataSetValues;
+
+    memset(&ctx, 0, sizeof(ctx));
+
     ctx.receiver = GooseReceiver_create();
+    if (!ctx.receiver) {
+        printf("GooseReceiver_create failed\n");
+        return NULL;
+    }
 
     GooseReceiver_setInterfaceId(ctx.receiver, ethport);
 
-    ctx.subscriber = GooseSubscriber_create("simpleIOGenericIO/LLN0$GO$gcbAnalogValues", NULL);
+    ctx.subscriber = GooseSubscriber_create(
+            "simpleIOGenericIO/LLN0$GO$gcbAnalogValues", NULL);
 
-    uint8_t dstMac[6] = {0x01,0x0c,0xcd,0x01,0x00,0x01};
+    uint8_t dstMac[6] = {0x01, 0x0c, 0xcd, 0x01, 0x00, 0x01};
     GooseSubscriber_setDstMac(ctx.subscriber, dstMac);
     GooseSubscriber_setAppId(ctx.subscriber, 1000);
 
     GooseSubscriber_setListener(ctx.subscriber, gooseListener, &ctx);
-
     GooseReceiver_addSubscriber(ctx.receiver, ctx.subscriber);
 
     GooseReceiver_start(ctx.receiver);
 
-    printf("ctx created\n");
-
-    ctx.pins[3] = true;
-
-    return &ctx;
-};
-
-bool goose_tick(void *ctx)
-{
-    goose_ctx* goose_ctx = ctx;
-    printf("goose_tick\n");
-    for (int i = 0; i < 4; ++i){
-        printf("number pin:%d, meaning of pin:%d\n", i, goose_ctx->pins[i]);
+    if (!GooseReceiver_isRunning(ctx.receiver)) {
+        printf("Failed to start GOOSE subscriber "
+               "(check interface / root privileges)\n");
+        GooseReceiver_destroy(ctx.receiver);
+        return NULL;
     }
-    return goose_ctx->newMessage;
+
+    printf("GOOSE subscriber started on %s\n", ethport);
+    return &ctx;
 }
 
-void goose_destroy(void *ctx)
+/* ------------------------------------------------------------------ */
+bool
+goose_get_pin(const void *ctx_ptr, unsigned index)
 {
-    goose_ctx* goose_ctx = ctx;
+    if (!ctx_ptr || index >= 4)
+        return false;
 
-    GooseReceiver_stop(goose_ctx->receiver);
-    
-    GooseReceiver_destroy(goose_ctx->receiver);
+    const goose_ctx *g = (const goose_ctx *)ctx_ptr;
+    return g->pins[index];
+}
+
+/* ------------------------------------------------------------------ */
+bool
+goose_tick(void *ctx_ptr)
+{
+    if (!ctx_ptr)
+        return false;
+
+    goose_ctx *g = (goose_ctx *)ctx_ptr;
+    uint64_t now = Hal_getTimeInMs();
+
+    /* --- 1. обработка нового сообщения --- */
+    bool was_new = g->newMessage;
+    if (was_new) {
+        g->newMessage = false;
+
+        /* собираем 4-битное значение */
+        unsigned gpio = 0;
+        for (int i = 0; i < 4; i++)
+            if (g->pins[i])
+                gpio |= (1u << i);
+
+        printf("[RX] stNum=%u sqNum=%u  pins=%d %d %d %d  -> gpio=0b%04b (%u)\n",
+               g->lastStNum, g->lastSqNum,
+               g->pins[0], g->pins[1], g->pins[2], g->pins[3],
+               gpio, gpio);
+    }
+
+    /* --- 2. контроль обрыва связи --- */
+    if (g->hasLastFrame && !g->linkFailed) {
+        if (now > g->lastRxMs + g->timeAllowedToLive) {
+            g->linkFailed = true;
+            printf("[RX] LINK FAILURE — no GOOSE for > %u ms "
+                   "(lastRx=%llu, now=%llu)\n",
+                   g->timeAllowedToLive,
+                   (unsigned long long)g->lastRxMs,
+                   (unsigned long long)now);
+        }
+    }
+
+    return was_new;
+}
+
+/* ------------------------------------------------------------------ */
+void
+goose_destroy(void *ctx_ptr)
+{
+    if (!ctx_ptr)
+        return;
+
+    goose_ctx *g = (goose_ctx *)ctx_ptr;
+
+    GooseReceiver_stop(g->receiver);
+    GooseReceiver_destroy(g->receiver);
     printf("goose destroyed\n");
-};
+}
